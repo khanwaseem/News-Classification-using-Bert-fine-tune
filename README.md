@@ -1,1 +1,3 @@
-Fine Tune bert for News Classification
+Fine Tune bert for News Classification 
+
+Updated readme
