@@ -1,4 +1,4 @@
 Fine Tune bert for News Classification 
 
 Updated readme
-Hello
+Hello 27/04/2022
