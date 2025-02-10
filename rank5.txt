@@ -1,0 +1,241 @@
+def train_model(model, train_loader, optimizer, num_epochs=50):
+    model.train()
+    
+    # Add gradient clipping
+    max_grad_norm = 1.0
+    
+    for epoch in range(num_epochs):
+        total_loss = 0
+        num_batches = 0
+        
+        for features, labels in train_loader:
+            optimizer.zero_grad()
+            
+            # Get model predictions
+            predictions = model(features)
+            
+            # Skip batches with all zero labels
+            if torch.all(labels == 0):
+                continue
+                
+            # Calculate loss
+            loss = listnet_loss(predictions, labels)
+            
+            # Check if loss is valid
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: Invalid loss value encountered: {loss.item()}")
+                continue
+            
+            # Backpropagation with gradient clipping
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            
+            current_loss = loss.item()
+            if not np.isnan(current_loss):
+                total_loss += current_loss
+                num_batches += 1
+            
+            # Print batch loss for debugging
+            print(f'Batch loss: {current_loss:.4f}')
+            
+        # Calculate average loss for epoch
+        if num_batches > 0:
+            avg_loss = total_loss / num_batches
+            print(f'Epoch [{epoch+1}/{num_epochs}], Average Loss: {avg_loss:.4f}')
+            
+            # Early stopping if loss is too high
+            if avg_loss > 1e6:
+                print("Loss too high, stopping training")
+                return
+     
+class ListNetModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128):
+        super(ListNetModel, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),  # Add batch normalization
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.BatchNorm1d(hidden_size//2),  # Add batch normalization
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size//2, 1)
+        )
+        
+        # Initialize weights properly
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+                
+                
+                
+def validate_data(features, labels):
+    # Check for NaN or infinite values
+    if torch.isnan(features).any() or torch.isinf(features).any():
+        print("Warning: Invalid values in features")
+        features = torch.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
+    
+    if torch.isnan(labels).any() or torch.isinf(labels).any():
+        print("Warning: Invalid values in labels")
+        labels = torch.nan_to_num(labels, nan=0.0, posinf=1e6, neginf=-1e6)
+    
+    return features, labels
+    
+
+def __getitem__(self, idx):
+    features, labels = self.features[idx], self.labels[idx]
+    return validate_data(features, labels)
+    
+    
+    
+# After training
+torch.save(model, 'listnet_model.pth')
+torch.save(label_encoders, 'label_encoders.pth')
+torch.save(scaler, 'scaler.pth')
+
+
+
+import torch
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+def load_model_and_preprocessors(model_path, label_encoders_path, scaler_path):
+    """
+    Load the trained model and preprocessing objects
+    """
+    # Load the model
+    model = torch.load(model_path)
+    model.eval()
+    
+    # Load label encoders and scaler
+    label_encoders = torch.load(label_encoders_path)
+    scaler = torch.load(scaler_path)
+    
+    return model, label_encoders, scaler
+
+def preprocess_new_data(df, label_encoders, scaler):
+    """
+    Preprocess new data using saved encoders and scaler
+    """
+    # Create a copy to avoid modifying the original data
+    processed_df = df.copy()
+    
+    # Encode categorical variables
+    categorical_columns = ['customer_complaint', 'vehicle_config']
+    for col in categorical_columns:
+        if col in label_encoders:
+            processed_df[col] = label_encoders[col].transform(processed_df[col])
+    
+    # Scale numerical features
+    numerical_columns = ['fault_code']
+    if len(numerical_columns) > 0:
+        processed_df[numerical_columns] = scaler.transform(processed_df[numerical_columns])
+    
+    return processed_df
+
+def prepare_features(df):
+    """
+    Prepare features for model input
+    """
+    # Group by techlane_id
+    feature_columns = ['customer_complaint', 'vehicle_config', 'fault_code']
+    grouped = df.groupby('techlane_id')
+    
+    features_list = []
+    techlane_ids = []
+    
+    for techlane_id, group in grouped:
+        features = group[feature_columns].values
+        features_list.append(features)
+        techlane_ids.append(techlane_id)
+    
+    return features_list, techlane_ids
+
+def predict_fault_priorities(model, features):
+    """
+    Make predictions using the trained model
+    """
+    model.eval()
+    with torch.no_grad():
+        # Convert features to tensor
+        features_tensor = torch.FloatTensor(features)
+        
+        # Add batch dimension if needed
+        if len(features_tensor.shape) == 2:
+            features_tensor = features_tensor.unsqueeze(0)
+        
+        # Get model predictions
+        predictions = model(features_tensor)
+        
+        # Convert to priorities
+        priorities = torch.argsort(predictions, dim=-1, descending=True)
+        
+        return priorities.numpy()
+
+def format_results(techlane_ids, original_df, predictions):
+    """
+    Format the results into a readable DataFrame
+    """
+    results = []
+    
+    for i, techlane_id in enumerate(techlane_ids):
+        group_data = original_df[original_df['techlane_id'] == techlane_id]
+        fault_codes = group_data['fault_code'].values
+        priorities = predictions[i]
+        
+        for j, (fault_code, priority) in enumerate(zip(fault_codes, priorities)):
+            results.append({
+                'techlane_id': techlane_id,
+                'fault_code': fault_code,
+                'predicted_priority': j + 1,
+                'original_rank': priority + 1
+            })
+    
+    return pd.DataFrame(results)
+
+def main():
+    # Load model and preprocessors
+    model_path = 'listnet_model.pth'
+    label_encoders_path = 'label_encoders.pth'
+    scaler_path = 'scaler.pth'
+    
+    model, label_encoders, scaler = load_model_and_preprocessors(
+        model_path, label_encoders_path, scaler_path
+    )
+    
+    # Load new data
+    # Replace this with your actual data loading
+    new_data = pd.DataFrame({
+        'techlane_id': [1, 1, 1, 2, 2],
+        'customer_complaint': ['A', 'A', 'A', 'B', 'B'],
+        'vehicle_config': ['X', 'X', 'X', 'Y', 'Y'],
+        'fault_code': [101, 102, 103, 201, 202]
+    })
+    
+    # Preprocess the data
+    processed_data = preprocess_new_data(new_data, label_encoders, scaler)
+    
+    # Prepare features
+    features_list, techlane_ids = prepare_features(processed_data)
+    
+    # Make predictions
+    predictions = predict_fault_priorities(model, features_list)
+    
+    # Format results
+    results_df = format_results(techlane_ids, new_data, predictions)
+    
+    # Print or save results
+    print("Fault Code Priority Predictions:")
+    print(results_df)
+    
+    # Optionally save results to CSV
+    results_df.to_csv('fault_priorities.csv', index=False)
+    
+    return results_df
+
+if __name__ == "__main__":
+    results = main()
