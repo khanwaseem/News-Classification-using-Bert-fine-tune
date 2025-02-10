@@ -1,0 +1,175 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch.utils.data import Dataset, DataLoader
+
+class FaultCodeDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = torch.FloatTensor(features)
+        self.labels = torch.FloatTensor(labels)
+    
+    def __len__(self):
+        return len(self.features)
+    
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+class ListNetModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128):
+        super(ListNetModel, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size//2, 1)
+        )
+    
+    def forward(self, x):
+        return self.network(x).squeeze()
+
+def listnet_loss(pred_scores, true_scores):
+    # Convert scores to probabilities using softmax
+    pred_probs = torch.softmax(pred_scores, dim=0)
+    true_probs = torch.softmax(true_scores, dim=0)
+    
+    # Calculate cross entropy loss
+    return -torch.sum(true_probs * torch.log(pred_probs + 1e-10))
+
+def prepare_data(df):
+    """
+    Prepare data for the ListNet model
+    """
+    # Encode categorical variables
+    categorical_columns = ['customer_complaint', 'vehicle_config']  # Add your categorical columns
+    label_encoders = {}
+    
+    for col in categorical_columns:
+        label_encoders[col] = LabelEncoder()
+        df[col] = label_encoders[col].fit_transform(df[col])
+    
+    # Normalize numerical features
+    scaler = StandardScaler()
+    numerical_columns = ['fault_code']  # Add your numerical columns
+    df[numerical_columns] = scaler.fit_transform(df[numerical_columns])
+    
+    # Group by techlane_id
+    grouped = df.groupby('techlane_id')
+    
+    features_list = []
+    labels_list = []
+    
+    for _, group in grouped:
+        # Combine features
+        features = group[categorical_columns + numerical_columns].values
+        labels = group['rank'].values
+        
+        features_list.append(features)
+        labels_list.append(labels)
+    
+    return features_list, labels_list, label_encoders, scaler
+
+def train_model(model, train_loader, optimizer, num_epochs=50):
+    model.train()
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for features, labels in train_loader:
+            optimizer.zero_grad()
+            
+            # Get model predictions
+            predictions = model(features)
+            
+            # Calculate loss
+            loss = listnet_loss(predictions, labels)
+            
+            # Backpropagation
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        if (epoch + 1) % 10 == 0:
+            print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(train_loader):.4f}')
+
+def evaluate_model(model, test_loader):
+    model.eval()
+    total_ndcg = 0
+    
+    with torch.no_grad():
+        for features, true_ranks in test_loader:
+            # Get model predictions
+            pred_scores = model(features)
+            
+            # Convert to rankings
+            _, pred_ranks = torch.sort(pred_scores, descending=True)
+            
+            # Calculate NDCG
+            ndcg = calculate_ndcg(true_ranks.numpy(), pred_ranks.numpy())
+            total_ndcg += ndcg
+    
+    return total_ndcg / len(test_loader)
+
+def calculate_ndcg(true_ranks, pred_ranks, k=None):
+    if k is None:
+        k = len(true_ranks)
+    
+    # Calculate DCG
+    dcg = np.sum([1/np.log2(rank + 2) for rank in pred_ranks[:k]])
+    
+    # Calculate IDCG
+    idcg = np.sum([1/np.log2(rank + 2) for rank in np.sort(true_ranks)[:k]])
+    
+    return dcg / idcg if idcg > 0 else 0
+
+def main():
+    # Load your data
+    # df = pd.read_csv('your_data.csv')
+    
+    # Sample data structure
+    df = pd.DataFrame({
+        'techlane_id': [1, 1, 1, 2, 2, 2],
+        'customer_complaint': ['A', 'A', 'A', 'B', 'B', 'B'],
+        'vehicle_config': ['X', 'X', 'X', 'Y', 'Y', 'Y'],
+        'fault_code': [101, 102, 103, 201, 202, 203],
+        'rank': [1, 2, 3, 1, 2, 3]
+    })
+    
+    # Prepare data
+    features_list, labels_list, label_encoders, scaler = prepare_data(df)
+    
+    # Split data into train and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        features_list, labels_list, test_size=0.2, random_state=42
+    )
+    
+    # Create datasets and dataloaders
+    train_dataset = FaultCodeDataset(X_train, y_train)
+    test_dataset = FaultCodeDataset(X_test, y_test)
+    
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    
+    # Initialize model
+    input_size = X_train[0].shape[1]  # Number of features
+    model = ListNetModel(input_size)
+    
+    # Initialize optimizer
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Train model
+    train_model(model, train_loader, optimizer)
+    
+    # Evaluate model
+    ndcg_score = evaluate_model(model, test_loader)
+    print(f'Final NDCG Score: {ndcg_score:.4f}')
+    
+    return model, label_encoders, scaler
+
+if __name__ == "__main__":
+    model, label_encoders, scaler = main()
