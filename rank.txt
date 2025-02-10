@@ -1,0 +1,117 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+
+# Load dataset
+df = pd.read_csv("dataset.csv")
+
+# Extract relevant columns
+categorical_cols = ["cat_var1", "cat_var2", "cat_var3", "cat_var4"]
+text_col = "fault_code"
+query_col = "techlane_id"
+target_col = "rank"
+
+# One-hot encode categorical variables
+one_hot_encoder = OneHotEncoder(sparse=False, handle_unknown="ignore")
+cat_features = one_hot_encoder.fit_transform(df[categorical_cols])
+# Convert fault_code to TF-IDF vectors
+tfidf_vectorizer = TfidfVectorizer()
+text_features = tfidf_vectorizer.fit_transform(df[text_col]).toarray()
+
+
+# Concatenate all features
+X = np.hstack((cat_features, text_features))
+y = df[target_col].values
+
+# Convert to tensors
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.float32)
+
+class ListNetDataset(Dataset):
+    def __init__(self, df, X_tensor, y_tensor):
+        self.df = df
+        self.X_tensor = X_tensor
+        self.y_tensor = y_tensor
+        self.groups = df[query_col].values  # Grouping by techlane_id
+
+    def __len__(self):
+        return len(self.groups)
+
+    def __getitem__(self, idx):
+        group = self.groups[idx]
+        mask = self.df[query_col] == group
+        
+        return self.X_tensor[mask], self.y_tensor[mask]
+
+dataset = ListNetDataset(df, X_tensor, y_tensor)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+
+
+class ListNet(nn.Module):
+    def __init__(self, input_dim):
+        super(ListNet, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)  # Single ranking score per fault code
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class ListNetLoss(nn.Module):
+    def forward(self, y_true, y_pred):
+        P_y_true = torch.softmax(y_true, dim=0)
+        P_y_pred = torch.softmax(y_pred, dim=0)
+        loss = -torch.sum(P_y_true * torch.log(P_y_pred + 1e-10))  # KL divergence
+        return loss
+
+
+# Initialize model, loss, and optimizer
+input_dim = X.shape[1]
+model = ListNet(input_dim)
+loss_fn = ListNetLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+
+num_epochs = 50
+
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
+    
+    for X_batch, y_batch in dataloader:
+        optimizer.zero_grad()
+        
+        y_pred = model(X_batch).squeeze(-1)
+        loss = loss_fn(y_batch, y_pred)
+        
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss:.4f}")
+
+
+def predict_rank(techlane_id):
+    mask = df[query_col] == techlane_id
+    X_test = X_tensor[mask]
+    
+    model.eval()
+    with torch.no_grad():
+        scores = model(X_test).squeeze(-1)
+        ranking = torch.argsort(scores, descending=True)
+    
+    ranked_fault_codes = df.loc[mask, "fault_code"].values[ranking.numpy()]
+    return ranked_fault_codes
+
+# Example: Predict ranking for a specific techlane_id
+print(predict_rank(techlane_id=12345))
+
