@@ -1,0 +1,186 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import joblib
+
+# Load dataset
+df = pd.read_csv("your_data.csv")
+
+# One-hot encode vehicle_configuration
+vehicle_encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+vehicle_config_encoded = vehicle_encoder.fit_transform(df[["vehicle_configuration"]])
+
+# TF-IDF for customer_complaint
+tfidf_vectorizer = TfidfVectorizer(max_features=500)
+complaint_tfidf = tfidf_vectorizer.fit_transform(df["customer_complaint"]).toarray()
+
+# One-hot encode fault_code
+fault_encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+fault_code_encoded = fault_encoder.fit_transform(df[["fault_code"]])
+
+# Normalize rank within each techlane_id
+df["normalized_rank"] = df.groupby("techlane_id")["rank"].transform(lambda x: x / x.max())
+
+# Combine features
+X = np.hstack((vehicle_config_encoded, complaint_tfidf, fault_code_encoded))
+y = df["normalized_rank"].values
+
+# Save encoders
+joblib.dump(vehicle_encoder, "vehicle_encoder.pkl")
+joblib.dump(tfidf_vectorizer, "tfidf_vectorizer.pkl")
+joblib.dump(fault_encoder, "fault_encoder.pkl")
+
+# Group by techlane_id
+grouped_data = df.groupby("techlane_id")
+
+# Create training data
+train_data = []
+for techlane_id, group in grouped_data:
+    X_group = X[group.index]
+    y_group = y[group.index]
+    train_data.append((torch.tensor(X_group, dtype=torch.float32), torch.tensor(y_group, dtype=torch.float32)))
+
+# Train-test split
+train_size = int(0.8 * len(train_data))
+train_data, test_data = train_data[:train_size], train_data[train_size:]
+
+
+
+
+class ListNetLoss(nn.Module):
+    def __init__(self):
+        super(ListNetLoss, self).__init__()
+
+    def forward(self, y_pred, y_true):
+        y_pred = F.softmax(y_pred, dim=-1)
+        y_true = F.softmax(y_true, dim=-1)
+        loss = -torch.sum(y_true * torch.log(y_pred + 1e-10))  # Avoid log(0)
+        return loss
+
+class TechlaneDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+train_loader = DataLoader(TechlaneDataset(train_data), batch_size=1, shuffle=True)
+test_loader = DataLoader(TechlaneDataset(test_data), batch_size=1, shuffle=False)
+
+
+
+class ListNetModel(nn.Module):
+    def __init__(self, input_dim):
+        super(ListNetModel, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.PReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.PReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+# Initialize model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ListNetModel(input_dim=X.shape[1]).to(device)
+criterion = ListNetLoss()
+optimizer = optim.AdamW(model.parameters(), lr=0.001)
+
+
+best_loss = float("inf")
+patience, patience_counter = 5, 0
+
+for epoch in range(50):
+    model.train()
+    total_loss = 0
+
+    for X_batch, y_batch in tqdm(train_loader):
+        X_batch, y_batch = X_batch[0].to(device), y_batch[0].to(device)  # Extract from batch
+
+        optimizer.zero_grad()
+        outputs = model(X_batch).squeeze()
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_loader)
+    print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+
+    # Early stopping
+    if avg_loss < best_loss:
+        best_loss = avg_loss
+        torch.save(model.state_dict(), "listnet_model.pth")
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+
+
+def preprocess_test_data(test_df):
+    # Load saved encoders
+    vehicle_encoder = joblib.load("vehicle_encoder.pkl")
+    tfidf_vectorizer = joblib.load("tfidf_vectorizer.pkl")
+    fault_encoder = joblib.load("fault_encoder.pkl")
+
+    # One-hot encoding
+    vehicle_config_encoded = vehicle_encoder.transform(test_df[["vehicle_configuration"]])
+    fault_code_encoded = fault_encoder.transform(test_df[["fault_code"]])
+
+    # TF-IDF
+    complaint_tfidf = tfidf_vectorizer.transform(test_df["customer_complaint"]).toarray()
+
+    # Combine features
+    X_test = np.hstack((vehicle_config_encoded, complaint_tfidf, fault_code_encoded))
+    return torch.tensor(X_test, dtype=torch.float32)
+
+def predict(test_df):
+    model = ListNetModel(input_dim=X.shape[1])
+    model.load_state_dict(torch.load("listnet_model.pth"))
+    model.to(device)
+    model.eval()
+
+    # Group test data by techlane_id
+    grouped_test = test_df.groupby("techlane_id")
+
+    results = []
+    for techlane_id, group in grouped_test:
+        X_test_tensor = preprocess_test_data(group).to(device)
+        with torch.no_grad():
+            predictions = model(X_test_tensor).squeeze().cpu().numpy()
+
+        group["predicted_rank"] = predictions
+        results.append(group)
+
+    final_df = pd.concat(results)
+    return final_df
+
+# Load test data
+test_df = pd.read_csv("test_data.csv")
+result_df = predict(test_df)
+
+# Save results
+result_df.to_csv("predicted_ranks.csv", index=False)
+print("Predictions saved.")
+
